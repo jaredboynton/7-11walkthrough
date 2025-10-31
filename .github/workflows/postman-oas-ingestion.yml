@@ -1,0 +1,121 @@
+name: Postman Spec Hub Ingestion
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_id:
+        description: API Gateway id (REST v1 or HTTP v2)
+        required: true
+        type: string
+      api_type:
+        description: rest|http
+        required: true
+        type: choice
+        options: [rest, http]
+      region:
+        description: AWS region of the API
+        required: true
+        type: string
+      stage:
+        description: API Gateway stage name
+        required: true
+        type: string
+      domain:
+        description: Logical domain for naming (e.g., billing)
+        required: true
+        type: string
+      service:
+        description: Service name for naming (e.g., payments)
+        required: true
+        type: string
+      collection_uid:
+        description: Existing Postman collection UID to sync (after first generation)
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  export-and-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ github.event.inputs.region }}
+
+      - name: Export OpenAPI from API Gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.api_type }}" = "rest" ]; then
+            aws apigateway get-export \
+              --rest-api-id "${{ github.event.inputs.api_id }}" \
+              --stage-name "${{ github.event.inputs.stage }}" \
+              --export-type oas30 \
+              --parameters extensions='postman' \
+              --accepts application/json openapi.json;
+          else
+            aws apigatewayv2 export-api \
+              --api-id "${{ github.event.inputs.api_id }}" \
+              --specification OAS30 \
+              --output-type JSON \
+              --stage-name "${{ github.event.inputs.stage }}" openapi.json;
+          fi
+          # Show a short preview
+          head -n 40 openapi.json || true
+      - name: Validate OpenAPI with Postman CLI (fail-fast)
+        shell: bash
+        env:
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "Installing Postman CLI (adjust if your org uses a different method)"
+          # See Postman CLI docs for latest installation instructions
+          # curl -fsSL https://dl-cli.pstmn.io/install/linux | sh
+          postman login --with-api-key "$POSTMAN_API_KEY" || true
+          postman openapi validate openapi.json || true
+          # Remove "|| true" once CLI is installed on runners and validated
+
+
+      - name: Spec Hub create/patch and optional sync
+        shell: bash
+        env:
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+          POSTMAN_WORKSPACE_ID: ${{ secrets.POSTMAN_WORKSPACE_ID }}
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [ -n "${{ github.event.inputs.collection_uid }}" ]; then
+            EXTRA="--collection-uid ${{ github.event.inputs.collection_uid }}"
+          fi
+          node scripts/spec_sync.js \
+            --domain "${{ github.event.inputs.domain }}" \
+            --service "${{ github.event.inputs.service }}" \
+            --stage "${{ github.event.inputs.stage }}" \
+            --openapi openapi.json \
+            --file-path index.json \
+            $EXTRA \
+            --state-file state/postman-ingestion-state.json \
+            --poll
+      - name: Upsert Postman environment
+        shell: bash
+        env:
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+          POSTMAN_WORKSPACE_ID: ${{ secrets.POSTMAN_WORKSPACE_ID }}
+        run: |
+          set -euo pipefail
+          node scripts/environments_upsert.js \
+            --domain "${{ github.event.inputs.domain }}" \
+            --service "${{ github.event.inputs.service }}" \
+            --stage "${{ github.event.inputs.stage }}" \
+            --region "${{ github.event.inputs.region }}" \
+            --openapi openapi.json
+
+

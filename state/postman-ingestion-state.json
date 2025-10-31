@@ -1,0 +1,10 @@
+{
+  "entries": {},
+  "meta": {
+    "description": "State file for Postman OAS ingestion workflow",
+    "version": "1.0",
+    "lastUpdated": null,
+    "note": "This file is automatically maintained by spec_sync.js. Entries map domain:service:stage to Postman spec and collection IDs for idempotent operations."
+  }
+}
+
