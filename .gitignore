@@ -28,5 +28,5 @@ npm-debug.log*
 *COMMANDS.md
 
 # State files
-state/postman-ingestion-state.json
+*postman-ingestion-state.json
 *openapi.json

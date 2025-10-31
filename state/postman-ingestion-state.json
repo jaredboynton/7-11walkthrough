@@ -7,4 +7,3 @@
     "note": "This file is automatically maintained by spec_sync.js. Entries map domain:service:stage to Postman spec and collection IDs for idempotent operations."
   }
 }
-
