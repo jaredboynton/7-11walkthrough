@@ -7,7 +7,9 @@ Spec Hub sync helper
 Inputs (env/args):
   env POSTMAN_API_KEY (required)
   env POSTMAN_WORKSPACE_ID (required)
-  args --domain <domain> --service <service> --stage <stage>
+  args --domain <domain> (optional, defaults to "demo")
+  args --service <service> (required)
+  args --stage <stage> (required)
   args --openapi <path to openapi.json> (required)
   args --file-path <spec file path> (default: index.json)
   args --spec-id <specId> (optional; otherwise resolve-by-name or create)
@@ -16,8 +18,8 @@ Inputs (env/args):
   args --poll (optional; if set, poll sync task to completion)
 
 Naming conventions:
-  specName = `[${domain}] ${service} #api`
-  collectionName = `[${domain}] ${service} #reference-${stage}`
+  specName = `[DEMO] ${service} #main`
+  collectionName = `[DEMO] ${service} #main`
 
 Notes:
 - Uses Node 18+ global fetch (no external deps)
@@ -73,7 +75,133 @@ function saveState(stateFile, state) {
 }
 
 function key(domain, service, stage) {
-  return `${domain}:${service}:${stage}`;
+  // Sanitize all components (replace spaces with underscores) for state file key
+  const sanitizedDomain = (domain || 'demo').replace(/\s+/g, '_');
+  const sanitizedService = service.replace(/\s+/g, '_');
+  const sanitizedStage = stage.replace(/\s+/g, '_');
+  return `${sanitizedDomain}:${sanitizedService}:${sanitizedStage}`;
+}
+
+function sanitizeServiceName(service) {
+  // Replace spaces with underscores for Postman asset names
+  return service.replace(/\s+/g, '_');
+}
+
+function transformSpecForPostman(specObj) {
+  // Deep clone to avoid mutating original
+  const transformed = JSON.parse(JSON.stringify(specObj));
+  
+  // Remove AWS-specific root-level extensions
+  delete transformed['x-amazon-apigateway-cors'];
+  delete transformed['x-amazon-apigateway-importexport-version'];
+  
+  // Filter out AWS CloudFormation tags, keep only meaningful tags
+  if (transformed.tags && Array.isArray(transformed.tags)) {
+    transformed.tags = transformed.tags.filter(tag => 
+      tag.name && !tag.name.startsWith('aws:') && !tag.name.startsWith('httpapi:')
+    );
+  }
+  
+  // Transform paths - convert AWS proxy routes to standard OpenAPI
+  if (transformed.paths) {
+    const transformedPaths = {};
+    
+    for (const [path, pathItem] of Object.entries(transformed.paths)) {
+      const cleanPathItem = {};
+      
+      // Handle proxy routes (/{proxy+}) by converting x-amazon-apigateway-any-method to common methods
+      if (pathItem['x-amazon-apigateway-any-method']) {
+        const anyMethod = pathItem['x-amazon-apigateway-any-method'];
+        // For proxy routes, create a generic POST method (common for Lambda proxies)
+        cleanPathItem.post = {
+          summary: `Proxy route: ${path}`,
+          description: `Generic proxy route that forwards requests to Lambda function`,
+          parameters: pathItem.parameters || [],
+          responses: anyMethod.responses || {
+            '200': { description: 'Success response' },
+            '500': { description: 'Error response' }
+          },
+          requestBody: {
+            description: 'Request body',
+            content: {
+              'application/json': {
+                schema: { type: 'object' }
+              }
+            }
+          }
+        };
+        
+        // Also add GET for common use cases
+        cleanPathItem.get = {
+          summary: `Proxy route: ${path}`,
+          description: `Generic proxy route that forwards requests to Lambda function`,
+          parameters: [
+            ...(pathItem.parameters || []),
+            {
+              name: 'query',
+              in: 'query',
+              description: 'Query parameters',
+              required: false,
+              schema: { type: 'object' }
+            }
+          ],
+          responses: anyMethod.responses || {
+            '200': { description: 'Success response' },
+            '500': { description: 'Error response' }
+          }
+        };
+      } else {
+        // For standard paths, copy method operations and clean AWS extensions
+        for (const [method, operation] of Object.entries(pathItem)) {
+          if (['get', 'post', 'put', 'patch', 'delete', 'head', 'options'].includes(method.toLowerCase())) {
+            const cleanOperation = { ...operation };
+            // Remove AWS-specific operation extensions
+            delete cleanOperation['x-amazon-apigateway-integration'];
+            delete cleanOperation['x-amazon-apigateway-request-validator'];
+            cleanPathItem[method] = cleanOperation;
+          }
+        }
+      }
+      
+      // Copy parameters if they exist
+      if (pathItem.parameters) {
+        cleanPathItem.parameters = pathItem.parameters.map(param => {
+          const cleanParam = { ...param };
+          delete cleanParam['x-amazon-apigateway-param'];
+          return cleanParam;
+        });
+      }
+      
+      // Only add path if it has at least one HTTP method
+      if (Object.keys(cleanPathItem).length > 0) {
+        transformedPaths[path] = cleanPathItem;
+      }
+    }
+    
+    transformed.paths = transformedPaths;
+  }
+  
+  // Clean up server URLs - remove template variables if they're just basePath
+  if (transformed.servers && Array.isArray(transformed.servers)) {
+    transformed.servers = transformed.servers.map(server => {
+      const cleaned = { ...server };
+      // If server has {basePath} variable and it defaults to stage, simplify
+      if (cleaned.variables && cleaned.variables.basePath) {
+        const basePath = cleaned.variables.basePath.default || '';
+        if (basePath && cleaned.url.includes('{basePath}')) {
+          cleaned.url = cleaned.url.replace('{basePath}', basePath);
+          delete cleaned.variables.basePath;
+          // Remove variables object if empty
+          if (Object.keys(cleaned.variables || {}).length === 0) {
+            delete cleaned.variables;
+          }
+        }
+      }
+      return cleaned;
+    });
+  }
+  
+  return transformed;
 }
 
 async function pmFetch(pathname, opts = {}) {
@@ -181,7 +309,7 @@ async function pollTask(taskUrlPath, apiKey, { timeoutMs = 180000, intervalMs = 
   try {
     const args = parseArgs(process.argv);
     const {
-      domain,
+      domain = 'demo',
       service,
       stage,
       openapi: openapiPath,
@@ -192,24 +320,28 @@ async function pollTask(taskUrlPath, apiKey, { timeoutMs = 180000, intervalMs = 
       poll,
     } = args;
 
-    if (!domain || !service || !stage || !openapiPath) {
-      console.error('Usage: node scripts/spec_sync.js --domain <domain> --service <service> --stage <stage> --openapi <openapi.json> [--file-path index.json] [--spec-id SPEC_ID] [--collection-uid UID] [--state-file path] [--poll]');
+    if (!service || !stage || !openapiPath) {
+      console.error('Usage: node scripts/spec_sync.js [--domain <domain>] --service <service> --stage <stage> --openapi <openapi.json> [--file-path index.json] [--spec-id SPEC_ID] [--collection-uid UID] [--state-file path] [--poll]');
+      console.error('  --domain defaults to "demo" if not provided');
       process.exit(2);
     }
 
     const POSTMAN_API_KEY = requireEnv('POSTMAN_API_KEY');
     const POSTMAN_WORKSPACE_ID = requireEnv('POSTMAN_WORKSPACE_ID');
 
-    const specName = `[${domain}] ${service} #api`;
-    const collectionName = `[${domain}] ${service} #reference-${stage}`;
+    const sanitizedService = sanitizeServiceName(service);
+    const specName = `[DEMO] ${sanitizedService} #main`;
+    const collectionName = `[DEMO] ${sanitizedService} #main`;
     const state = loadState(stateFile);
     const entryKey = key(domain, service, stage);
     const entry = state.entries[entryKey] || {};
 
-    // read and stringify openapi content
+    // read and transform openapi content for Postman compatibility
     const fileStat = fs.statSync(openapiPath);
     if (fileStat.size > 10 * 1024 * 1024) throw new Error('OpenAPI file exceeds 10 MB limit');
-    const fileText = fs.readFileSync(openapiPath, 'utf8');
+    const originalSpec = JSON.parse(fs.readFileSync(openapiPath, 'utf8'));
+    const transformedSpec = transformSpecForPostman(originalSpec);
+    const fileText = JSON.stringify(transformedSpec, null, 2);
 
     // Resolve/create specId (prefer cached -> arg -> resolve-by-name -> create)
     let specId = entry.specId || specIdArg;

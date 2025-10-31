@@ -25,3 +25,8 @@ npm-debug.log*
 *11_workingsession.md
 *validation.md
 *local*
+*COMMANDS.md
+
+# State files
+state/postman-ingestion-state.json
+*openapi.json
