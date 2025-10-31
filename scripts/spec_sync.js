@@ -2,7 +2,9 @@
 /*
 Spec Hub sync helper
 - Resolves Spec by name in workspace (or creates it), then patches root file content
-- Optionally resolves Collection by name (or uses provided UID) and syncs via async endpoint
+- Automatically generates collection if none exists (POST /specs/{specId}/generations/collection)
+- Automatically syncs collection if it exists (PUT /collections/{collectionUid}/synchronizations)
+- Resolves Collection UID via: state file -> spec's generated collections -> name lookup
 
 Inputs (env/args):
   env POSTMAN_API_KEY (required)
@@ -13,9 +15,9 @@ Inputs (env/args):
   args --openapi <path to openapi.json> (required)
   args --file-path <spec file path> (default: index.json)
   args --spec-id <specId> (optional; otherwise resolve-by-name or create)
-  args --collection-uid <collectionUid> (optional; otherwise resolve-by-name)
+  args --collection-uid <collectionUid> (optional; otherwise auto-detect)
   args --state-file <path> (default: state/postman-ingestion-state.json)
-  args --poll (optional; if set, poll sync task to completion)
+  args --poll (optional; if set, poll sync/generation tasks to completion)
 
 Naming conventions:
   specName = `[DEMO] ${service} #main`
@@ -25,6 +27,8 @@ Notes:
 - Uses Node 18+ global fetch (no external deps)
 - Maintains a lightweight state file; falls back to resolve-by-name each run
 - If you already know specId/collectionUid, pass them via flags to skip discovery
+- Generation tasks are always polled to completion to extract collection UID
+- Sync tasks are only polled if --poll flag is provided
 */
 
 const fs = require('fs');
@@ -204,6 +208,87 @@ function transformSpecForPostman(specObj) {
   return transformed;
 }
 
+// ============================================================================
+// Multi-Environment Configuration Support
+// ============================================================================
+
+function loadEnvironmentConfig(configPath = 'config/environments.json') {
+  try {
+    if (!fs.existsSync(configPath)) {
+      console.log(`No environment config found at ${configPath}, skipping multi-env setup`);
+      return null;
+    }
+    return readJsonFile(configPath);
+  } catch (err) {
+    console.warn(`Failed to load environment config: ${err.message}`);
+    return null;
+  }
+}
+
+function getServiceEnvironments(config, service) {
+  if (!config || !config.services) return [];
+  const sanitizedService = sanitizeServiceName(service);
+  const serviceConfig = config.services[sanitizedService] || config.services[service];
+  if (!serviceConfig) return [];
+  return (serviceConfig.environments || []).filter(env => env.enabled !== false);
+}
+
+function enrichSpecWithEnvironments(spec, service, config) {
+  const envs = getServiceEnvironments(config, service);
+  if (!envs || envs.length === 0) {
+    console.log(`No environments configured for ${service}, keeping original servers block`);
+    return spec;
+  }
+
+  const sanitizedService = sanitizeServiceName(service);
+  const serviceConfig = config.services[sanitizedService] || config.services[service];
+  const urlPattern = serviceConfig.apiUrlPattern;
+
+  // Extract unique values for enum lists
+  const regions = [...new Set(envs.map(e => e.region))];
+  const stages = [...new Set(envs.map(e => e.stage))];
+  const apiIds = [...new Set(envs.map(e => e.apiId).filter(Boolean))];
+
+  // Build server entry with template variables
+  const serverEntry = {
+    url: urlPattern,
+    description: `AWS API Gateway endpoint (multi-region, ${envs.length} environments configured)`,
+    variables: {}
+  };
+
+  // Add variables based on what's in the URL pattern
+  if (urlPattern.includes('{apiId}')) {
+    serverEntry.variables.apiId = {
+      default: apiIds[0] || envs[0]?.apiId || 'API_ID',
+      description: 'API Gateway ID',
+    };
+    if (apiIds.length > 1) {
+      serverEntry.variables.apiId.enum = apiIds;
+    }
+  }
+
+  if (urlPattern.includes('{region}')) {
+    serverEntry.variables.region = {
+      default: regions[0],
+      enum: regions,
+      description: 'AWS region'
+    };
+  }
+
+  if (urlPattern.includes('{stage}')) {
+    serverEntry.variables.stage = {
+      default: stages[0],
+      enum: stages,
+      description: 'Deployment stage'
+    };
+  }
+
+  spec.servers = [serverEntry];
+  console.log(`Enriched spec with ${envs.length} environments: ${envs.map(e => e.name).join(', ')}`);
+  
+  return spec;
+}
+
 async function pmFetch(pathname, opts = {}) {
   const resp = await fetch(`${API_BASE}${pathname}`, opts);
   if (!resp.ok && resp.status !== 202) {
@@ -283,8 +368,50 @@ async function findCollectionByName(workspaceId, name, apiKey) {
   }
 }
 
+async function getSpecCollections(specId, apiKey) {
+  // GET /specs/{specId}/collections - Get a spec's generated collections
+  try {
+    const { data } = await pmFetch(`/specs/${encodeURIComponent(specId)}/collections`, {
+      headers: { 'x-api-key': apiKey },
+    });
+    // Response may be { collections: [...] } or just array
+    return Array.isArray(data?.collections) ? data.collections : (Array.isArray(data) ? data : []);
+  } catch (e) {
+    return [];
+  }
+}
+
+async function generateCollectionFromSpec(workspaceId, specId, collectionName, apiKey) {
+  // POST /specs/{specId}/generations/collection - Generate a collection from spec
+  const body = {
+    name: collectionName,
+    options: {
+      requestNameSource: "Fallback",
+      indentCharacter: "Space",
+      parametersResolution: "Schema",
+      folderStrategy: "Paths",
+      includeAuthInfoInExample: true,
+      enableOptionalParameters: true,
+      keepImplicitHeaders: false,
+      includeDeprecated: true,
+      alwaysInheritAuthentication: false,
+      nestedFolderHierarchy: false,
+    },
+  };
+  const { data, resp } = await pmFetch(`/specs/${encodeURIComponent(specId)}/generations/collection?workspaceId=${encodeURIComponent(workspaceId)}`, {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  // Returns 202 Accepted with task info for polling
+  return { accepted: resp.status === 202, task: data };
+}
 
 async function syncCollection(collectionUid, specId, apiKey) {
+  // PUT /collections/{collectionUid}/synchronizations?specId={specId} - Sync collection with spec
   const { data, resp } = await pmFetch(`/collections/${encodeURIComponent(collectionUid)}/synchronizations?specId=${encodeURIComponent(specId)}`, {
     method: 'PUT',
     headers: { 'x-api-key': apiKey },
@@ -303,6 +430,105 @@ async function pollTask(taskUrlPath, apiKey, { timeoutMs = 180000, intervalMs = 
     await new Promise((r) => setTimeout(r, intervalMs));
   }
   return last;
+}
+
+async function listEnvironments(workspaceId, apiKey) {
+  try {
+    const { data } = await pmFetch(`/environments?workspaceId=${encodeURIComponent(workspaceId)}`, {
+      headers: { 'x-api-key': apiKey },
+    });
+    return data?.environments || data || [];
+  } catch (e) {
+    return [];
+  }
+}
+
+async function findEnvironmentByName(workspaceId, name, apiKey) {
+  try {
+    const envs = await listEnvironments(workspaceId, apiKey);
+    return (Array.isArray(envs) ? envs : []).find(e => e.name === name) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function upsertEnvironment(workspaceId, name, variables, apiKey, existingUid = null) {
+  const envBody = {
+    name,
+    values: variables
+  };
+
+  if (existingUid) {
+    // Update existing environment
+    try {
+      const { data } = await pmFetch(`/environments/${encodeURIComponent(existingUid)}`, {
+        method: 'PUT',
+        headers: { 
+          'x-api-key': apiKey, 
+          'content-type': 'application/json' 
+        },
+        body: JSON.stringify({ environment: envBody })
+      });
+      return data.environment?.uid || existingUid;
+    } catch (err) {
+      console.warn(`Failed to update environment ${name} (${existingUid}), will try to create new one: ${err.message}`);
+    }
+  }
+
+  // Create new environment (or fallback if update failed)
+  const { data } = await pmFetch(`/environments?workspaceId=${encodeURIComponent(workspaceId)}`, {
+    method: 'POST',
+    headers: { 
+      'x-api-key': apiKey, 
+      'content-type': 'application/json' 
+    },
+    body: JSON.stringify({ environment: envBody })
+  });
+  return data.environment?.uid || data.uid;
+}
+
+async function createEnvironmentsFromConfig(workspaceId, domain, service, config, apiKey, stateEntry) {
+  const envs = getServiceEnvironments(config, service);
+  if (!envs || envs.length === 0) {
+    console.log(`No environments configured for ${service}, skipping environment creation`);
+    return {};
+  }
+
+  const sanitizedService = sanitizeServiceName(service);
+  const serviceConfig = config.services[sanitizedService] || config.services[service];
+  const urlPattern = serviceConfig.apiUrlPattern;
+  const createdEnvs = {};
+
+  console.log(`Creating/updating ${envs.length} Postman environments...`);
+
+  for (const env of envs) {
+    const envName = `[${domain}] ${sanitizedService} #${env.name}`;
+    
+    // Build baseUrl by replacing template variables
+    let baseUrl = urlPattern;
+    baseUrl = baseUrl.replace('{apiId}', env.apiId || '{apiId}');
+    baseUrl = baseUrl.replace('{region}', env.region || '{region}');
+    baseUrl = baseUrl.replace('{stage}', env.stage || '{stage}');
+
+    const envVars = [
+      { key: 'baseUrl', value: baseUrl, type: 'default', enabled: true },
+      { key: 'region', value: env.region, type: 'default', enabled: true },
+      { key: 'stage', value: env.stage, type: 'default', enabled: true },
+      { key: 'apiId', value: env.apiId, type: 'default', enabled: true },
+      { key: 'description', value: env.description || `${env.stage} environment in ${env.region}`, type: 'default', enabled: true }
+    ];
+
+    try {
+      const existingUid = stateEntry.environments?.[env.name];
+      const envUid = await upsertEnvironment(workspaceId, envName, envVars, apiKey, existingUid);
+      createdEnvs[env.name] = envUid;
+      console.log(`  ✓ ${envName} (${envUid})`);
+    } catch (err) {
+      console.error(`  ✗ Failed to create/update environment ${envName}: ${err.message}`);
+    }
+  }
+
+  return createdEnvs;
 }
 
 (async () => {
@@ -336,11 +562,20 @@ async function pollTask(taskUrlPath, apiKey, { timeoutMs = 180000, intervalMs = 
     const entryKey = key(domain, service, stage);
     const entry = state.entries[entryKey] || {};
 
+    // Load environment configuration for multi-env support
+    const envConfig = loadEnvironmentConfig();
+
     // read and transform openapi content for Postman compatibility
     const fileStat = fs.statSync(openapiPath);
     if (fileStat.size > 10 * 1024 * 1024) throw new Error('OpenAPI file exceeds 10 MB limit');
     const originalSpec = JSON.parse(fs.readFileSync(openapiPath, 'utf8'));
-    const transformedSpec = transformSpecForPostman(originalSpec);
+    let transformedSpec = transformSpecForPostman(originalSpec);
+    
+    // Enrich spec with multi-environment servers block if config exists
+    if (envConfig) {
+      transformedSpec = enrichSpecWithEnvironments(transformedSpec, service, envConfig);
+    }
+    
     const fileText = JSON.stringify(transformedSpec, null, 2);
 
     // Resolve/create specId (prefer cached -> arg -> resolve-by-name -> create)
@@ -367,9 +602,31 @@ async function pollTask(taskUrlPath, apiKey, { timeoutMs = 180000, intervalMs = 
     await patchSpecFile(specId, specFilePath, fileText, POSTMAN_API_KEY);
     console.log(`Patched spec file ${specFilePath}`);
 
-    // Sync collection if known; otherwise try resolve-by-name
+    // Resolve collection UID using multiple methods:
+    // 1. State file (entry.collectionUid)
+    // 2. Spec's generated collections (GET /specs/{specId}/collections)
+    // 3. Name lookup (findCollectionByName)
     let collectionUid = entry.collectionUid || collectionUidArg;
+    
     if (!collectionUid) {
+      // Try to find collection via spec's generated collections
+      const specCollections = await getSpecCollections(specId, POSTMAN_API_KEY);
+      if (specCollections && specCollections.length > 0) {
+        // Look for a collection matching our expected name
+        const matchingCol = specCollections.find(c => c.name === collectionName);
+        if (matchingCol?.uid) {
+          collectionUid = matchingCol.uid;
+          console.log(`Resolved Collection from spec's generated collections: ${collectionName} -> ${collectionUid}`);
+        } else if (specCollections[0]?.uid) {
+          // If only one collection exists for this spec, use it
+          collectionUid = specCollections[0].uid;
+          console.log(`Resolved Collection from spec (single collection): ${collectionUid}`);
+        }
+      }
+    }
+    
+    if (!collectionUid) {
+      // Fallback to name lookup
       const foundCol = await findCollectionByName(POSTMAN_WORKSPACE_ID, collectionName, POSTMAN_API_KEY);
       if (foundCol?.uid) {
         collectionUid = foundCol.uid;
@@ -377,20 +634,111 @@ async function pollTask(taskUrlPath, apiKey, { timeoutMs = 180000, intervalMs = 
       }
     }
 
+    // Generate or sync collection
     if (collectionUid) {
+      // Collection exists - sync it with the spec
+      console.log(`Syncing collection ${collectionUid} with spec ${specId}...`);
       const { accepted, task } = await syncCollection(collectionUid, specId, POSTMAN_API_KEY);
       console.log(`Sync requested (202 expected): ${accepted}, task: ${JSON.stringify(task)}`);
       if (poll && task?.url) {
+        console.log(`Polling sync task...`);
         const taskResult = await pollTask(task.url, POSTMAN_API_KEY);
         console.log(`Sync task completed: ${JSON.stringify(taskResult)}`);
+        if (taskResult?.status !== 'success' && taskResult?.status !== 'completed') {
+          const errorMsg = taskResult?.details || taskResult?.error?.message || 'Unknown error';
+          throw new Error(`Collection sync failed: ${errorMsg}\nFull response: ${JSON.stringify(taskResult, null, 2)}`);
+        }
       }
-      entry.collectionUid = collectionUid;
-      state.entries[entryKey] = entry;
-      saveState(stateFile, state);
     } else {
-      console.log('No collection UID resolved. Generate a collection from the Spec (once) in Postman, then rerun to sync.');
-      console.log(`Expected collection name: ${collectionName}`);
+      // Collection doesn't exist - generate it from the spec
+      console.log(`No collection found. Generating collection "${collectionName}" from spec ${specId}...`);
+      const { accepted, task } = await generateCollectionFromSpec(
+        POSTMAN_WORKSPACE_ID,
+        specId,
+        collectionName,
+        POSTMAN_API_KEY
+      );
+
+      if (!accepted || !task?.url) {
+        throw new Error(`Failed to generate collection. Response: ${JSON.stringify(task)}`);
+      }
+
+      console.log(`Generation task started: ${JSON.stringify(task)}`);
+      
+      // Always poll generation tasks to get the collection UID
+      console.log(`Polling generation task...`);
+      const taskResult = await pollTask(task.url, POSTMAN_API_KEY);
+      console.log(`Generation task completed: ${JSON.stringify(taskResult)}`);
+
+      if (taskResult?.status !== 'success' && taskResult?.status !== 'completed') {
+        const errorMsg = taskResult?.details || taskResult?.error?.message || 'Unknown error';
+        throw new Error(`Collection generation failed: ${errorMsg}\nFull response: ${JSON.stringify(taskResult, null, 2)}`);
+      }
+
+      // Extract collection UID from task result
+      // Task result structure: { details: { resources: [{ url: "/collections/{uid}", id: "{uid}" }] } }
+      let generatedCollectionUid = null;
+      
+      // Try to extract from resources array in details
+      if (taskResult?.details?.resources && Array.isArray(taskResult.details.resources)) {
+        const resource = taskResult.details.resources.find(r => r.url?.includes('/collections/'));
+        if (resource) {
+          generatedCollectionUid = resource.id || resource.url?.split('/collections/')[1];
+        }
+      }
+      
+      // Fallback to other possible locations
+      if (!generatedCollectionUid) {
+        generatedCollectionUid = taskResult?.result?.collection?.uid || 
+                                 taskResult?.collection?.uid || 
+                                 taskResult?.result?.uid ||
+                                 taskResult?.uid;
+      }
+      
+      if (!generatedCollectionUid) {
+        // If we can't get UID from task result, try to find the collection by name
+        console.log(`Warning: Could not extract collection UID from task result. Looking up by name...`);
+        const foundCollection = await findCollectionByName(POSTMAN_WORKSPACE_ID, collectionName, POSTMAN_API_KEY);
+        if (foundCollection?.uid) {
+          console.log(`Found collection by name: ${foundCollection.uid}`);
+          generatedCollectionUid = foundCollection.uid;
+        } else {
+          throw new Error(`Failed to extract collection UID and collection not found by name. Task result: ${JSON.stringify(taskResult)}`);
+        }
+      }
+
+      collectionUid = generatedCollectionUid;
+      console.log(`Generated Collection: ${collectionName} (${collectionUid})`);
+      console.log(`Collection is automatically linked to spec ${specId}`);
     }
+
+    // Update state file with collection UID
+    entry.collectionUid = collectionUid;
+    if (!entry.specId) {
+      entry.specId = specId;
+    }
+
+    // Create/update Postman environments from config
+    if (envConfig) {
+      console.log(''); // Blank line for readability
+      const createdEnvs = await createEnvironmentsFromConfig(
+        POSTMAN_WORKSPACE_ID,
+        domain,
+        service,
+        envConfig,
+        POSTMAN_API_KEY,
+        entry
+      );
+      
+      if (Object.keys(createdEnvs).length > 0) {
+        entry.environments = { ...entry.environments, ...createdEnvs };
+        console.log(`Created/updated ${Object.keys(createdEnvs).length} environments`);
+      }
+    }
+
+    state.entries[entryKey] = entry;
+    saveState(stateFile, state);
+    console.log(`State file updated for ${entryKey}`);
   } catch (err) {
     console.error(err.stack || String(err));
     process.exit(1);

@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Configuration for multi-environment Postman setup. Defines all valid region/stage combinations for each service.",
+  "services": {
+    "foundation_index": {
+      "displayName": "Foundation Index",
+      "apiUrlPattern": "https://{apiId}.execute-api.{region}.amazonaws.com/{stage}",
+      "environments": [
+        {
+          "name": "dev-us-east-1",
+          "description": "Development environment in US East (N. Virginia)",
+          "region": "us-east-1",
+          "stage": "dev",
+          "apiId": "x1qsir1lc1",
+          "enabled": true
+        },
+        {
+          "name": "staging-us-east-1",
+          "description": "Staging environment in US East (N. Virginia)",
+          "region": "us-east-1",
+          "stage": "staging",
+          "apiId": "x1qsir1lc1",
+          "enabled": false,
+          "note": "Not yet deployed - set enabled:true when ready"
+        },
+        {
+          "name": "prod-us-east-1",
+          "description": "Production environment in US East (N. Virginia)",
+          "region": "us-east-1",
+          "stage": "prod",
+          "apiId": "x1qsir1lc1",
+          "enabled": false,
+          "note": "Not yet deployed - set enabled:true when ready"
+        }
+      ]
+    }
+  },
+  "meta": {
+    "version": "1.0",
+    "lastUpdated": "2025-10-31",
+    "note": "This file is the source of truth for environment configuration. Add new region/stage combos here to auto-generate Postman environments."
+  }
+}
+

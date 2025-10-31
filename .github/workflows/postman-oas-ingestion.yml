@@ -8,10 +8,11 @@ on:
         required: true
         type: string
       api_type:
-        description: rest|http
-        required: true
+        description: Auto-detect (default) or force rest/http/websocket
+        required: false
+        default: auto
         type: choice
-        options: [rest, http]
+        options: [auto, rest, http, websocket]
       region:
         description: AWS region of the API
         required: true
@@ -21,16 +22,13 @@ on:
         required: true
         type: string
       domain:
-        description: Logical domain for naming (e.g., billing)
-        required: true
+        description: Logical domain for naming (defaults to "demo")
+        required: false
         type: string
+        default: "demo"
       service:
         description: Service name for naming (e.g., payments)
         required: true
-        type: string
-      collection_uid:
-        description: Existing Postman collection UID to sync (after first generation)
-        required: false
         type: string
 
 permissions:
@@ -50,27 +48,81 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ github.event.inputs.region }}
 
-      - name: Export OpenAPI from API Gateway
+      - name: Detect API type and export OpenAPI spec
+        id: export_openapi
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ github.event.inputs.api_type }}" = "rest" ]; then
-            aws apigateway get-export \
-              --rest-api-id "${{ github.event.inputs.api_id }}" \
-              --stage-name "${{ github.event.inputs.stage }}" \
-              --export-type oas30 \
-              --parameters extensions='postman' \
-              --accepts application/json openapi.json;
+
+          API_ID="${{ github.event.inputs.api_id }}"
+          STAGE="${{ github.event.inputs.stage }}"
+          INPUT_TYPE="${{ github.event.inputs.api_type }}"
+
+          to_lower() {
+            echo "$1" | tr '[:upper:]' '[:lower:]'
+          }
+
+          TYPE=$(to_lower "${INPUT_TYPE:-}")
+
+          if [ -z "$TYPE" ] || [ "$TYPE" = "auto" ]; then
+            echo "Auto-detecting API type..."
+            if OUTPUT=$(aws apigatewayv2 get-api --api-id "$API_ID" 2>/tmp/apigw2_err); then
+              PROTOCOL=$(echo "$OUTPUT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ProtocolType", "").lower())')
+              if [ "$PROTOCOL" = "http" ]; then
+                TYPE="http"
+              elif [ "$PROTOCOL" = "websocket" ]; then
+                TYPE="websocket"
+              else
+                echo "Unknown ProtocolType '$PROTOCOL' from apigatewayv2 get-api, continuing detection."
+              fi
+            else
+              echo "apigatewayv2 get-api failed; falling back to REST v1 detection" >&2
+              cat /tmp/apigw2_err >&2 || true
+            fi
+
+            if [ -z "$TYPE" ]; then
+              if aws apigateway get-rest-api --rest-api-id "$API_ID" >/tmp/apigw_rest.json 2>/tmp/apigw_err; then
+                TYPE="rest"
+              else
+                echo "Unable to detect API type for $API_ID" >&2
+                cat /tmp/apigw_err >&2 || true
+                exit 1
+              fi
+            fi
+          elif [ "$TYPE" = "rest" ] || [ "$TYPE" = "http" ] || [ "$TYPE" = "websocket" ]; then
+            echo "Using manually selected API type: $TYPE"
           else
+            echo "Unsupported api_type input: $TYPE" >&2
+            exit 1
+          fi
+
+          echo "api_type=$TYPE" >> "$GITHUB_OUTPUT"
+
+          if [ "$TYPE" = "websocket" ]; then
+            echo "Detected WebSocket API; skipping OpenAPI export and downstream steps."
+            exit 0
+          fi
+
+          if [ "$TYPE" = "http" ]; then
             aws apigatewayv2 export-api \
-              --api-id "${{ github.event.inputs.api_id }}" \
+              --api-id "$API_ID" \
               --specification OAS30 \
               --output-type JSON \
-              --stage-name "${{ github.event.inputs.stage }}" openapi.json;
+              --stage-name "$STAGE" \
+              openapi.json
+          else
+            aws apigateway get-export \
+              --rest-api-id "$API_ID" \
+              --stage-name "$STAGE" \
+              --export-type oas30 \
+              --accepts application/json \
+              openapi.json
           fi
-          # Show a short preview
+
+          echo "Exported OpenAPI document (type=$TYPE). Preview:"
           head -n 40 openapi.json || true
       - name: Validate OpenAPI with Postman CLI (fail-fast)
+        if: steps.export_openapi.outputs.api_type != 'websocket'
         shell: bash
         env:
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
@@ -84,37 +136,45 @@ jobs:
           # Remove "|| true" once CLI is installed on runners and validated
 
 
-      - name: Spec Hub create/patch and optional sync
+      - name: Sync spec and collection to Postman
+        if: steps.export_openapi.outputs.api_type != 'websocket'
         shell: bash
         env:
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
           POSTMAN_WORKSPACE_ID: ${{ secrets.POSTMAN_WORKSPACE_ID }}
         run: |
           set -euo pipefail
-          EXTRA=""
-          if [ -n "${{ github.event.inputs.collection_uid }}" ]; then
-            EXTRA="--collection-uid ${{ github.event.inputs.collection_uid }}"
-          fi
+          DOMAIN_INPUT="${{ github.event.inputs.domain }}"
+          SERVICE_INPUT="${{ github.event.inputs.service }}"
+          STAGE_INPUT="${{ github.event.inputs.stage }}"
+          DOMAIN="${DOMAIN_INPUT:-demo}"
+          STATE_FILE="state/postman-ingestion-state.json"
+          # spec_sync.js now automatically generates collection if it doesn't exist,
+          # or syncs it if it does exist. --poll ensures we wait for tasks to complete.
           node scripts/spec_sync.js \
-            --domain "${{ github.event.inputs.domain }}" \
-            --service "${{ github.event.inputs.service }}" \
-            --stage "${{ github.event.inputs.stage }}" \
+            --domain "$DOMAIN" \
+            --service "$SERVICE_INPUT" \
+            --stage "$STAGE_INPUT" \
             --openapi openapi.json \
             --file-path index.json \
-            $EXTRA \
-            --state-file state/postman-ingestion-state.json \
+            --state-file "$STATE_FILE" \
             --poll
       - name: Upsert Postman environment
+        if: steps.export_openapi.outputs.api_type != 'websocket'
         shell: bash
         env:
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
           POSTMAN_WORKSPACE_ID: ${{ secrets.POSTMAN_WORKSPACE_ID }}
         run: |
           set -euo pipefail
+          DOMAIN_INPUT="${{ github.event.inputs.domain }}"
+          SERVICE_INPUT="${{ github.event.inputs.service }}"
+          STAGE_INPUT="${{ github.event.inputs.stage }}"
+          DOMAIN="${DOMAIN_INPUT:-demo}"
           node scripts/environments_upsert.js \
-            --domain "${{ github.event.inputs.domain }}" \
-            --service "${{ github.event.inputs.service }}" \
-            --stage "${{ github.event.inputs.stage }}" \
+            --domain "$DOMAIN" \
+            --service "$SERVICE_INPUT" \
+            --stage "$STAGE_INPUT" \
             --region "${{ github.event.inputs.region }}" \
             --openapi openapi.json
 
