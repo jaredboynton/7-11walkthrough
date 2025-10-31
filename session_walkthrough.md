@@ -41,11 +41,12 @@ Confirm connectivity and credentials upfront to prevent common errors during the
 
 **Action**: Run the automated preflight validation script to check all prerequisites at once.
 
+**Option 1: Using environment variables** (recommended for production/shared use):
 ```bash
 # Navigate to project directory
-cd /path/to/Automated_Ingestion_OAS_Lambda
+cd /path/to/711-demo-walkthrough
 
-# Set environment variables first
+# Set environment variables from .env file (if using dotenv) or export manually
 export POSTMAN_API_KEY="your-postman-api-key-here"
 export POSTMAN_WORKSPACE_ID="your-workspace-id-here"
 
@@ -60,95 +61,19 @@ node scripts/preflight_check.js
 - ✓ Postman workspace ID set
 - ✓ Scripts available
 - ✓ State directory initialized
+- ✓ jq (optional but helpful)
 
-**If preflight check passes**: You can skip to Phase 3 (Core Flow Execution) or proceed with manual validation steps below for educational purposes.
+**If preflight check passes**: Proceed directly to Phase 3 (Core Flow Execution).
 
-**If preflight check fails**: Follow the remediation suggestions in the output, then rerun the check.
+**If preflight check fails**: Follow the remediation suggestions shown in the output for each failed check. The script provides specific guidance for fixing each issue (e.g., "Run: aws configure" or "Regenerate API key in Postman Settings > API Keys").
 
 **Troubleshooting**:
 - If script doesn't exist: Ensure you're in the project root directory
-- If "Missing required env": Export `POSTMAN_API_KEY` and `POSTMAN_WORKSPACE_ID` first
-- Review error messages in the output for specific remediation steps
+- If "Missing required env": Either export `POSTMAN_API_KEY` and `POSTMAN_WORKSPACE_ID` as environment variables, or use `preflight_check_local.js` which has credentials hardcoded
+- Review error messages in the output - each check provides specific remediation steps
+- All checks must pass before proceeding to Phase 3
 
----
-
-### Manual Validation Steps (Optional if preflight passed)
-
-If you want to understand each check individually, or if preflight check encountered issues, follow these manual steps:
-
-### Step 2.1: AWS CLI Authentication
-
-**Action**: Verify AWS credentials are valid and have access to API Gateway.
-
-```bash
-aws sts get-caller-identity
-```
-
-**Expected Output**: JSON response with `UserId`, `Account`, and `Arn`.
-
-**Troubleshooting**:
-- If "Unable to locate credentials": Run `aws configure` or check `AWS_PROFILE` environment variable
-- If "ExpiredToken": Refresh your AWS session credentials
-- Verify you're in the correct AWS account for the basket API
-
-### Step 2.2: Postman API Key Validation
-
-**Action**: Test that your Postman API key is valid and has correct permissions.
-
-```bash
-curl --location 'https://api.getpostman.com/me' \
-  --header "X-Api-Key: YOUR_POSTMAN_API_KEY"
-```
-
-**Expected Output**: JSON response with user info including `id`, `username`, and `fullName`.
-
-**Troubleshooting**:
-- If `401 Unauthorized`: API key is invalid - regenerate in Postman Settings > API keys
-- If `403 Forbidden`: API key lacks necessary permissions - ensure it has workspace write access
-- **Important**: After this session, revoke the API key and create a new one for security
-
-### Step 2.3: Node.js Environment
-
-**Action**: Verify Node.js version and install dependencies.
-
-```bash
-# Check Node.js version (need v18+)
-node -v
-
-# Navigate to the project directory
-cd /path/to/Automated_Ingestion_OAS_Lambda
-
-# Install dependencies (if needed)
-npm install
-```
-
-**Expected Output**: Node.js version v18.x.x or higher (scripts use native fetch API).
-
-**Troubleshooting**:
-- If Node.js < v18: Upgrade using nvm: `nvm install 18 && nvm use 18`
-- If npm install fails: The scripts have no external dependencies - they use Node.js native modules only
-- Verify scripts exist: `ls -la scripts/spec_sync.js scripts/environments_upsert.js`
-
-### Step 2.4: Set Environment Variables
-
-**Action**: Export required environment variables for the session.
-
-```bash
-export POSTMAN_API_KEY="your-postman-api-key-here"
-export POSTMAN_WORKSPACE_ID="your-workspace-id-here"
-```
-
-**Getting your Workspace ID**:
-1. Open Postman workspace in browser
-2. Click three dots (⋯) next to workspace name in top right
-3. Select "Workspace Settings"
-4. Copy the Workspace ID from the info panel
-
-**Validation**: Echo the variables to confirm they're set:
-```bash
-echo $POSTMAN_API_KEY | head -c 20  # Should show first 20 chars
-echo $POSTMAN_WORKSPACE_ID          # Should show full UUID
-```
+**Note**: The preflight script validates all prerequisites automatically. Manual validation steps are no longer needed unless troubleshooting specific issues reported by the script.
 
 ---
 
